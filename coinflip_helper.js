@@ -78,6 +78,78 @@ async function finalizeAndRecordOutcome(sessionId, finalStatus, finalGameState =
 // --- CORE GAME LOGIC (PORTED FROM index.js) ---
 
 /**
+ * The entry point for the helper bot when it picks up a new game session.
+ * @param {string} mainBotGameId - The unique game ID from the main bot.
+ */
+async function handleNewGameSession(mainBotGameId) {
+    const logPrefix = `[CoinflipHelper_HandleNew GID:${mainBotGameId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        // Claim the session so other helpers don't grab it
+        const sessionRes = await client.query(
+            "UPDATE coinflip_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE main_bot_game_id = $2 AND status = 'pending_pickup' RETURNING *",
+            [BOT_ID, mainBotGameId]
+        );
+
+        if (sessionRes.rowCount === 0) {
+            console.log(`${logPrefix} Session was already picked up or is not pending.`);
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const session = sessionRes.rows[0];
+        await client.query('COMMIT');
+
+        activeHelperGames.set(session.session_id, session);
+        const gameState = session.game_state_json || {};
+        const initiatorName = escapeHTML(gameState.initiatorName || `Player ${session.initiator_id}`);
+        const betAmountDisplay = `${(Number(session.bet_amount_lamports) / 1e9).toFixed(4)} SOL`;
+        let messageText, keyboard;
+
+        // Decide if it's a direct challenge or a unified offer
+        if (session.opponent_id) {
+            const opponentName = escapeHTML(gameState.opponentName || `Player ${session.opponent_id}`);
+            messageText = `Hey ${opponentName}❗\n\n${initiatorName} has challenged you to a <b>Coinflip</b> duel for <b>${betAmountDisplay}</b>!`;
+            keyboard = { inline_keyboard: [
+                [{ text: "✅ Accept Challenge", callback_data: `cf_helper_accept_direct:${session.session_id}` }],
+                [{ text: "❌ Decline Challenge", callback_data: `cf_helper_decline_direct:${session.session_id}` }],
+                [{ text: "🚫 Withdraw (Initiator)", callback_data: `cf_helper_cancel:${session.session_id}` }]
+            ]};
+            session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS);
+        } else {
+            messageText = `🪙 <b>Coinflip Challenge</b>\n\n${initiatorName} has wagered <b>${betAmountDisplay}</b>.\n\nWho will face them?`;
+            keyboard = { inline_keyboard: [
+                [{ text: "🤖 Challenge Bot", callback_data: `cf_helper_accept_bot:${session.session_id}` }],
+                [{ text: "⚔️ Accept PvP", callback_data: `cf_helper_accept_pvp:${session.session_id}` }],
+                [{ text: "🚫 Cancel (Initiator)", callback_data: `cf_helper_cancel:${session.session_id}` }]
+            ]};
+            session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), UNIFIED_OFFER_TIMEOUT_MS);
+        }
+        
+        const sentMessage = await safeSendMessage(session.chat_id, messageText, { parse_mode: 'HTML', reply_markup: keyboard });
+        if (sentMessage) {
+            session.game_state_json.helperMessageId = sentMessage.message_id;
+            await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
+        } else {
+            await finalizeAndRecordOutcome(session.session_id, 'completed_error_ui', { error: "Failed to send initial offer message" });
+        }
+
+    } catch (e) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`${logPrefix} Error handling new session: ${e.message}`);
+        const sessionFromMap = activeHelperGames.get(mainBotGameId);
+        if(sessionFromMap) {
+            await finalizeAndRecordOutcome(sessionFromMap.session_id, 'completed_error', {error: e.message});
+        }
+    } finally {
+        if (client) client.release();
+    }
+}
+
+/**
  * Manages the UI for a unified offer (PvB vs PvP).
  * @param {object} session - The game session object from the database.
  */
