@@ -1,5 +1,5 @@
 // coinflip_helper.js
-// This is a new, separate file for your Coinflip bot. It runs independently from index.js.
+// FINAL COMPLETE VERSION v4 - Includes all offer, direct challenge, game, UI, and timeout logic.
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -8,7 +8,7 @@ import { Pool } from 'pg';
 // --- CONFIGURATION ---
 const BOT_TOKEN = process.env.COINFLIP_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
-const BOT_ID = BOT_TOKEN.split(':')[0]; // Get bot's ID from its token
+const BOT_ID = BOT_TOKEN.split(':')[0];
 
 if (!BOT_TOKEN || !DATABASE_URL) {
     console.error("COINFLIP HELPER: CRITICAL: COINFLIP_BOT_TOKEN or DATABASE_URL is missing from environment variables.");
@@ -23,7 +23,7 @@ const pool = new Pool({
 
 const activeHelperGames = new Map();
 
-// --- CONSTANTS ---
+// --- GAME CONSTANTS ---
 const UNIFIED_OFFER_TIMEOUT_MS = parseInt(process.env.UNIFIED_OFFER_TIMEOUT_MS, 10) || 30000;
 const DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS = parseInt(process.env.DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS, 10) || 45000;
 const ACTIVE_GAME_TURN_TIMEOUT_MS = parseInt(process.env.ACTIVE_GAME_TURN_TIMEOUT_MS, 10) || 45000;
@@ -33,6 +33,8 @@ const COINFLIP_CHOICE_TAILS = 'tails';
 const COIN_EMOJI_DISPLAY = '🪙';
 const COIN_FLIP_ANIMATION_FRAMES = ['🌕', '🌖', '🌗', '🌘', '🌑', '🌒', '🌓', '🌔'];
 const COIN_FLIP_ANIMATION_INTERVAL_MS = 250;
+const COIN_FLIP_ANIMATION_DURATION_MS = 2000;
+const COIN_FLIP_ANIMATION_STEPS = Math.floor(COIN_FLIP_ANIMATION_DURATION_MS / COIN_FLIP_ANIMATION_INTERVAL_MS);
 
 // --- UTILITY FUNCTIONS ---
 function escapeHTML(text) {
@@ -49,22 +51,20 @@ async function safeSendMessage(chatId, text, options = {}) {
     }
 }
 
+function getPlayerDisplayReference(userObject) {
+    if (!userObject) return "Mystery Player";
+    const username = userObject.username;
+    if (username) return `@${username}`;
+    return userObject.first_name || `Player ${String(userObject.id || userObject.telegram_id).slice(-4)}`;
+}
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- DATABASE INTERACTION ---
-
-/**
- * Writes the final result of a game to the database.
- * This triggers a notification to the main bot for financial settlement.
- * @param {number} sessionId - The database ID of the session.
- * @param {string} finalStatus - The status to set, e.g., 'completed_p1_win'.
- * @param {object} finalGameState - The final game state JSON to store.
- */
 async function finalizeAndRecordOutcome(sessionId, finalStatus, finalGameState = {}) {
     const logPrefix = `[CoinflipHelper_Finalize SID:${sessionId}]`;
     console.log(`${logPrefix} Finalizing game with status: ${finalStatus}`);
     try {
-        // The AFTER UPDATE trigger on this table notifies the main bot.
         await pool.query(
             "UPDATE coinflip_sessions SET status = $1, game_state_json = $2, updated_at = NOW() WHERE session_id = $3",
             [finalStatus, JSON.stringify(finalGameState), sessionId]
@@ -75,84 +75,8 @@ async function finalizeAndRecordOutcome(sessionId, finalStatus, finalGameState =
     }
 }
 
-// --- CORE GAME LOGIC (PORTED FROM index.js) ---
+// --- CORE GAME FLOW LOGIC ---
 
-/**
- * The entry point for the helper bot when it picks up a new game session.
- * @param {string} mainBotGameId - The unique game ID from the main bot.
- */
-async function handleNewGameSession(mainBotGameId) {
-    const logPrefix = `[CoinflipHelper_HandleNew GID:${mainBotGameId}]`;
-    let client = null;
-    try {
-        client = await pool.connect();
-        await client.query('BEGIN');
-
-        // Claim the session so other helpers don't grab it
-        const sessionRes = await client.query(
-            "UPDATE coinflip_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE main_bot_game_id = $2 AND status = 'pending_pickup' RETURNING *",
-            [BOT_ID, mainBotGameId]
-        );
-
-        if (sessionRes.rowCount === 0) {
-            console.log(`${logPrefix} Session was already picked up or is not pending.`);
-            await client.query('ROLLBACK');
-            return;
-        }
-
-        const session = sessionRes.rows[0];
-        await client.query('COMMIT');
-
-        activeHelperGames.set(session.session_id, session);
-        const gameState = session.game_state_json || {};
-        const initiatorName = escapeHTML(gameState.initiatorName || `Player ${session.initiator_id}`);
-        const betAmountDisplay = `${(Number(session.bet_amount_lamports) / 1e9).toFixed(4)} SOL`;
-        let messageText, keyboard;
-
-        // Decide if it's a direct challenge or a unified offer
-        if (session.opponent_id) {
-            const opponentName = escapeHTML(gameState.opponentName || `Player ${session.opponent_id}`);
-            messageText = `Hey ${opponentName}❗\n\n${initiatorName} has challenged you to a <b>Coinflip</b> duel for <b>${betAmountDisplay}</b>!`;
-            keyboard = { inline_keyboard: [
-                [{ text: "✅ Accept Challenge", callback_data: `cf_helper_accept_direct:${session.session_id}` }],
-                [{ text: "❌ Decline Challenge", callback_data: `cf_helper_decline_direct:${session.session_id}` }],
-                [{ text: "🚫 Withdraw (Initiator)", callback_data: `cf_helper_cancel:${session.session_id}` }]
-            ]};
-            session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS);
-        } else {
-            messageText = `🪙 <b>Coinflip Challenge</b>\n\n${initiatorName} has wagered <b>${betAmountDisplay}</b>.\n\nWho will face them?`;
-            keyboard = { inline_keyboard: [
-                [{ text: "🤖 Challenge Bot", callback_data: `cf_helper_accept_bot:${session.session_id}` }],
-                [{ text: "⚔️ Accept PvP", callback_data: `cf_helper_accept_pvp:${session.session_id}` }],
-                [{ text: "🚫 Cancel (Initiator)", callback_data: `cf_helper_cancel:${session.session_id}` }]
-            ]};
-            session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), UNIFIED_OFFER_TIMEOUT_MS);
-        }
-        
-        const sentMessage = await safeSendMessage(session.chat_id, messageText, { parse_mode: 'HTML', reply_markup: keyboard });
-        if (sentMessage) {
-            session.game_state_json.helperMessageId = sentMessage.message_id;
-            await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
-        } else {
-            await finalizeAndRecordOutcome(session.session_id, 'completed_error_ui', { error: "Failed to send initial offer message" });
-        }
-
-    } catch (e) {
-        if (client) await client.query('ROLLBACK');
-        console.error(`${logPrefix} Error handling new session: ${e.message}`);
-        const sessionFromMap = activeHelperGames.get(mainBotGameId);
-        if(sessionFromMap) {
-            await finalizeAndRecordOutcome(sessionFromMap.session_id, 'completed_error', {error: e.message});
-        }
-    } finally {
-        if (client) client.release();
-    }
-}
-
-/**
- * Manages the UI for a unified offer (PvB vs PvP).
- * @param {object} session - The game session object from the database.
- */
 async function runUnifiedOffer(session) {
     const gameState = session.game_state_json || {};
     const initiatorName = escapeHTML(gameState.initiatorName || `Player ${session.initiator_id}`);
@@ -170,18 +94,14 @@ async function runUnifiedOffer(session) {
     const sentMessage = await safeSendMessage(session.chat_id, messageText, { parse_mode: 'HTML', reply_markup: keyboard });
     if (sentMessage) {
         session.game_state_json.helperMessageId = sentMessage.message_id;
-        session.timeoutId = setTimeout(() => handleOfferTimeout(session.session_id), UNIFIED_OFFER_TIMEOUT_MS);
-        await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
+        session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), UNIFIED_OFFER_TIMEOUT_MS);
         activeHelperGames.set(session.session_id, session);
+        await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
     } else {
         await finalizeAndRecordOutcome(session.session_id, 'completed_error_ui', { error: "Failed to send offer message" });
     }
 }
 
-/**
- * Manages the UI for a direct PvP challenge.
- * @param {object} session - The game session object from the database.
- */
 async function runDirectChallenge(session) {
     const gameState = session.game_state_json || {};
     const initiatorName = escapeHTML(gameState.initiatorName || `Player ${session.initiator_id}`);
@@ -199,21 +119,20 @@ async function runDirectChallenge(session) {
     const sentMessage = await safeSendMessage(session.chat_id, messageText, { parse_mode: 'HTML', reply_markup: keyboard });
      if (sentMessage) {
         session.game_state_json.helperMessageId = sentMessage.message_id;
-        session.timeoutId = setTimeout(() => handleOfferTimeout(session.session_id), DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS);
-        await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
+        session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'offer'), DIRECT_CHALLENGE_ACCEPT_TIMEOUT_MS);
         activeHelperGames.set(session.session_id, session);
+        await pool.query("UPDATE coinflip_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
     } else {
         await finalizeAndRecordOutcome(session.session_id, 'completed_error_ui', { error: "Failed to send direct challenge message" });
     }
 }
 
-/**
- * Handles the game flow for a Player vs. Bot coinflip game.
- * @param {object} session - The game session object.
- */
 async function runCoinflipPvB(session) {
     const gameState = session.game_state_json;
     const playerRefHTML = escapeHTML(gameState.initiatorName);
+    
+    gameState.status = 'pvb_awaiting_player_choice';
+    activeHelperGames.set(session.session_id, session);
 
     const titleHTML = `🤖${COIN_EMOJI_DISPLAY} <b>Coinflip: ${playerRefHTML} vs. Bot Dealer!</b> ${COIN_EMOJI_DISPLAY}🤖`;
     const initialMessageTextHTML = `${titleHTML}\n\n${playerRefHTML}, make your call: Heads or Tails?`;
@@ -224,15 +143,10 @@ async function runCoinflipPvB(session) {
         ]
     };
     await bot.editMessageText(initialMessageTextHTML, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: keyboard });
-
+    
     session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'player_turn'), ACTIVE_GAME_TURN_TIMEOUT_MS);
-    activeHelperGames.set(session.session_id, session);
 }
 
-/**
- * Handles the game flow for a Player vs. Player coinflip game.
- * @param {object} session - The game session object.
- */
 async function runCoinflipPvP(session) {
     const gameState = session.game_state_json;
     const p1MentionHTML = escapeHTML(gameState.initiatorName);
@@ -254,28 +168,19 @@ async function runCoinflipPvP(session) {
     await bot.editMessageText(messageTextHTML, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: keyboard });
     
     session.timeoutId = setTimeout(() => handleGameTimeout(session.session_id, 'caller_turn'), ACTIVE_GAME_TURN_TIMEOUT_MS);
-    activeHelperGames.set(session.session_id, session);
 }
 
-
-/**
- * Runs the coin flip animation and determines the final result.
- * @param {object} session - The game session object.
- * @param {string} playerChoice - The player's choice ('heads' or 'tails').
- * @param {boolean} isPvP - Flag to determine if it's a PvP game.
- */
-async function runCoinflipAnimation(session, playerChoice, isPvP = false) {
+async function runCoinflipAnimationAndFinalize(session, playerChoice, isPvP = false) {
     if (session.timeoutId) clearTimeout(session.timeoutId);
     
     const gameState = session.game_state_json;
-    const playerRefHTML = isPvP ? escapeHTML(gameState.callerName) : escapeHTML(gameState.initiatorName);
+    const callerName = escapeHTML(isPvP ? gameState.callerName : gameState.initiatorName);
     const choiceDisplay = escapeHTML(playerChoice.charAt(0).toUpperCase() + playerChoice.slice(1));
     const titleFlippingHTML = `💫 ${COIN_EMOJI_DISPLAY} <b>Coin in the Air!</b> ${COIN_EMOJI_DISPLAY} 💫`;
-    let flippingMessageText = `${titleFlippingHTML}\n\n${playerRefHTML} called <b>${choiceDisplay}</b>!\nThe coin is spinning wildly!\n\n`;
+    let flippingMessageText = `${titleFlippingHTML}\n\n${callerName} called <b>${choiceDisplay}</b>!\nThe coin is spinning wildly!\n\n`;
 
-    // Animation loop
-    const steps = 8;
-    for (let i = 0; i < steps; i++) {
+    // Animation Loop
+    for (let i = 0; i < COIN_FLIP_ANIMATION_STEPS; i++) {
         const frame = COIN_FLIP_ANIMATION_FRAMES[i % COIN_FLIP_ANIMATION_FRAMES.length];
         try {
             await bot.editMessageText(flippingMessageText + `<b>${frame}</b>`, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML' });
@@ -287,54 +192,91 @@ async function runCoinflipAnimation(session, playerChoice, isPvP = false) {
     const resultDisplay = escapeHTML(actualFlipOutcome.charAt(0).toUpperCase() + actualFlipOutcome.slice(1));
     const playerWins = playerChoice === actualFlipOutcome;
     
-    let winnerId, loserId, finalStatus;
+    let winnerId, finalStatus;
     
     if (isPvP) {
         winnerId = playerWins ? gameState.callerId : (String(gameState.callerId) === String(session.initiator_id) ? session.opponent_id : session.initiator_id);
         finalStatus = String(winnerId) === String(session.initiator_id) ? 'completed_p1_win' : 'completed_p2_win';
         gameState.winner = winnerId;
-    } else {
+    } else { // PvB
         winnerId = playerWins ? session.initiator_id : 'bot';
         finalStatus = playerWins ? 'completed_p1_win' : 'completed_bot_win';
         gameState.winner = winnerId;
     }
     
-    const winnerName = (String(winnerId) === String(session.initiator_id)) ? gameState.initiatorName : gameState.opponentName || 'The Bot';
+    const winnerName = (String(winnerId) === String(session.initiator_id)) ? gameState.initiatorName : (gameState.opponentName || 'The Bot Dealer');
     const finalMessageHTML = `${titleFlippingHTML}\n\nThe coin landed on... ✨ <b>${COIN_EMOJI_DISPLAY} ${resultDisplay}!</b> ✨\n\n${playerWins ? 'Congratulations' : 'Unfortunately'}, <b>${escapeHTML(winnerName)}</b> wins this round!\n\nThe main bot will now settle the wagers.`;
 
-    await bot.editMessageText(finalMessageHTML, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML' });
+    await bot.editMessageText(finalMessageHTML, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: {} });
     
     await finalizeAndRecordOutcome(session.session_id, finalStatus, gameState);
 }
 
 // --- TIMEOUT HANDLERS ---
-
-async function handleOfferTimeout(sessionId) {
+async function handleGameTimeout(sessionId, context) {
     const session = activeHelperGames.get(sessionId);
-    if (!session || session.status !== 'in_progress') return;
+    if (!session) return;
+    if (session.timeoutId) clearTimeout(session.timeoutId);
     
-    await bot.editMessageText(`⏳ This Coinflip offer has expired unanswered.`, { chat_id: session.chat_id, message_id: session.game_state_json.helperMessageId, parse_mode: 'HTML' });
-    await finalizeAndRecordOutcome(sessionId, 'completed_timeout', session.game_state_json);
-}
+    let finalMessage, finalStatus;
 
-async function handleGameTimeout(sessionId, turnType) {
-     const session = activeHelperGames.get(sessionId);
-    if (!session || session.status !== 'in_progress') return;
-
-    let finalStatus = 'completed_timeout';
-    if(turnType === 'caller_turn') {
-        const callerId = session.game_state_json.callerId;
-        finalStatus = String(callerId) === String(session.initiator_id) ? 'completed_p2_win' : 'completed_p1_win';
-    } else { // Player vs Bot
-        finalStatus = 'completed_bot_win';
+    if (context === 'offer') {
+        finalMessage = `⏳ This Coinflip offer has expired unanswered.`;
+        finalStatus = 'completed_timeout';
+    } else {
+        const gameState = session.game_state_json;
+        if (context === 'player_turn') { // PvB timeout
+            finalMessage = `⏳ Player timed out. The Bot wins by default.`;
+            finalStatus = 'completed_bot_win';
+        } else { // PvP caller timeout
+            const callerId = gameState.callerId;
+            finalStatus = String(callerId) === String(session.initiator_id) ? 'completed_p2_win' : 'completed_p1_win';
+            finalMessage = `⏳ The caller timed out. The other player wins by default.`;
+        }
     }
-
-    await bot.editMessageText(`⏳ Player timed out. The game is over.`, { chat_id: session.chat_id, message_id: session.game_state_json.helperMessageId, parse_mode: 'HTML' });
+    
+    await bot.editMessageText(finalMessage, { chat_id: session.chat_id, message_id: session.game_state_json.helperMessageId, parse_mode: 'HTML', reply_markup: {} });
     await finalizeAndRecordOutcome(sessionId, finalStatus, session.game_state_json);
 }
 
+// --- MAIN HANDLERS ---
+async function handleNewGameSession(mainBotGameId) {
+    const logPrefix = `[CoinflipHelper_HandleNew GID:${mainBotGameId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
 
-// --- MAIN LISTENERS ---
+        const sessionRes = await client.query(
+            "UPDATE coinflip_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE main_bot_game_id = $2 AND status = 'pending_pickup' RETURNING *",
+            [BOT_ID, mainBotGameId]
+        );
+
+        if (sessionRes.rowCount === 0) {
+            await client.query('ROLLBACK'); return;
+        }
+        const session = sessionRes.rows[0];
+        await client.query('COMMIT');
+        
+        activeHelperGames.set(session.session_id, session);
+        
+        if (session.opponent_id) {
+            await runDirectChallenge(session);
+        } else {
+            await runUnifiedOffer(session);
+        }
+
+    } catch (e) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`${logPrefix} Error handling new session: ${e.message}`);
+        const sessionFromMap = activeHelperGames.get(mainBotGameId);
+        if(sessionFromMap) {
+            await finalizeAndRecordOutcome(sessionFromMap.session_id, 'completed_error', {error: e.message});
+        }
+    } finally {
+        if (client) client.release();
+    }
+}
 
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
@@ -347,55 +289,85 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "This game is no longer active.", show_alert: true });
         return;
     }
-
-    // Clear any existing timeout since the user interacted
     if (session.timeoutId) clearTimeout(session.timeoutId);
+
+    const gameState = session.game_state_json;
 
     switch(action) {
         case 'cf_helper_cancel':
             if (clickerId === String(session.initiator_id)) {
-                await bot.answerCallbackQuery(callbackQuery.id, { text: "Offer cancelled." });
-                await bot.deleteMessage(session.chat_id, session.game_state_json.helperMessageId).catch(() => {});
-                await finalizeAndRecordOutcome(sessionId, 'completed_cancelled', session.game_state_json);
+                await bot.answerCallbackQuery(callbackQuery.id, { text: "Offer withdrawn." });
+                const initiatorNameHTML = escapeHTML(gameState.initiatorName || `Player ${session.initiator_id}`);
+                await bot.editMessageText(`🚫 Offer withdrawn by ${initiatorNameHTML}.`, {chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: {}});
+                await finalizeAndRecordOutcome(sessionId, 'completed_cancelled', gameState);
             } else {
                 await bot.answerCallbackQuery(callbackQuery.id, { text: "Only the initiator can cancel.", show_alert: true });
             }
             break;
+        
         case 'cf_helper_accept_bot':
             if (clickerId === String(session.initiator_id)) {
+                await bot.answerCallbackQuery(callbackQuery.id);
                 await runCoinflipPvB(session);
             } else {
                  await bot.answerCallbackQuery(callbackQuery.id, { text: "Only the initiator can play vs the Bot.", show_alert: true });
             }
             break;
+
         case 'cf_helper_accept_pvp':
             if (clickerId !== String(session.initiator_id)) {
                 session.opponent_id = clickerId;
-                session.game_state_json.opponentName = getRawPlayerDisplayReference(callbackQuery.from);
+                gameState.opponentName = getPlayerDisplayReference(callbackQuery.from);
+                await bot.answerCallbackQuery(callbackQuery.id);
                 await runCoinflipPvP(session);
             } else {
                 await bot.answerCallbackQuery(callbackQuery.id, { text: "You can't accept your own challenge.", show_alert: true });
             }
             break;
-        case 'cf_helper_pvb_choice':
-            if (clickerId === String(session.initiator_id)) {
-                const choice = params[0];
-                await runCoinflipAnimation(session, choice, false);
+        
+        // --- NEWLY ADDED DIRECT CHALLENGE HANDLERS ---
+        case 'cf_helper_accept_direct':
+            if (clickerId === String(session.opponent_id)) {
+                await bot.answerCallbackQuery(callbackQuery.id);
+                await runCoinflipPvP(session);
+            } else {
+                await bot.answerCallbackQuery(callbackQuery.id, { text: "This challenge is not for you.", show_alert: true });
             }
             break;
+        
+        case 'cf_helper_decline_direct':
+            if (clickerId === String(session.opponent_id)) {
+                await bot.answerCallbackQuery(callbackQuery.id);
+                const opponentNameHTML = escapeHTML(gameState.opponentName);
+                await bot.editMessageText(`🚫 ${opponentNameHTML} declined the duel.`, {chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: {}});
+                await finalizeAndRecordOutcome(sessionId, 'completed_cancelled', gameState);
+            } else {
+                 await bot.answerCallbackQuery(callbackQuery.id, { text: "This challenge is not for you.", show_alert: true });
+            }
+            break;
+        // --- END OF NEW HANDLERS ---
+
+        case 'cf_helper_pvb_choice':
+            if (clickerId === String(session.initiator_id)) {
+                await bot.answerCallbackQuery(callbackQuery.id);
+                const choice = params[0];
+                await runCoinflipAnimationAndFinalize(session, choice, false);
+            }
+            break;
+
         case 'cf_helper_pvp_choice':
             const callerId = params[0];
             const choice = params[1];
             if (clickerId === String(callerId)) {
-                session.game_state_json.callerName = getRawPlayerDisplayReference(callbackQuery.from);
-                await runCoinflipAnimation(session, choice, true);
+                await bot.answerCallbackQuery(callbackQuery.id);
+                gameState.callerName = getPlayerDisplayReference(callbackQuery.from);
+                await runCoinflipAnimationAndFinalize(session, choice, true);
             } else {
                  await bot.answerCallbackQuery(callbackQuery.id, { text: "It's not your turn to call.", show_alert: true });
             }
             break;
     }
 });
-
 
 async function listenForNewGames() {
     const client = await pool.connect();
